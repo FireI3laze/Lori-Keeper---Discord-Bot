@@ -1,3 +1,6 @@
+import discord
+
+
 def application_message_embed(discord, guild, user, support_role_id):
     embed = discord.Embed(
         title="Welcome to the Application!",
@@ -25,3 +28,14 @@ def application_message_embed(discord, guild, user, support_role_id):
     embed.set_image(url="attachment://application_question.webp")
 
     return embed
+
+def server_stats_embed():
+    embed = discord.Embed(
+        title="Server Stats",
+        description="Aktualisierte Daten hier",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Playtime", value="123h", inline=True)
+    embed.add_field(name="Players Online", value="5", inline=True)
+    return embed
+
