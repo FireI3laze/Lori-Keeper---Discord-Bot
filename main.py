@@ -202,7 +202,7 @@ async def on_member_join(member: discord.Member):
         await member.add_roles(role, reason="Auto-assign Visitor role on join")
 
 
-@bot.event  #Hier reagiert der Bot auf die gesetzte Nachricht um eine Auswahlmöglichkeit ein Rollen bereit zustellen
+@bot.event
 async def on_message(member_instance):
     global total_coins
     user = member_instance.author.name
@@ -238,14 +238,14 @@ def confirm_check(ctx):
         )
     return inner_check
 
-@bot.command(name="del", help="Löscht den aktuellen Channel")
+@bot.command(name="del", help="Deletes the channel")
 @commands.has_permissions(manage_channels=True)
 async def delete_channel(ctx):
     channel = ctx.channel
     category = channel.category
 
     if category.id in (tickets_category_id, applications_category_id):
-        await channel.delete(reason=f"Gelöscht von {ctx.author}")
+        await channel.delete(reason=f"Deleted by {ctx.author}")
     else:
         await ctx.send("Are you sure you want to delete this channel? It cannot be restored. y/n")
 
