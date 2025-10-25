@@ -1,18 +1,21 @@
 import ast
+import concurrent
 import logging
 import ssl
 import os
 from xml.dom import SyntaxErr
 
+import ftputil
 import matplotlib.pyplot as plt
 import io
 
-from datetime import datetime, timedelta, timezone
+import datetime
 import signal
 import asyncio
 
 import aiohttp
 import discord
+from discord import app_commands, Embed
 from discord.ext import commands, tasks
 from discord.ui import View, Button
 from dotenv import load_dotenv
@@ -25,6 +28,12 @@ import responses
 import urllib.parse
 import json
 from aiohttp import web
+
+from stats import ftp_downloader, usercache, constants
+from stats.leaderboard import build_leaderboard, get_surrounding_leaderboard, escape_discord, format_leaderboard
+
+import stats.usercache
+
 
 # Load Token
 load_dotenv()
@@ -127,9 +136,7 @@ async def handle_application_button(interaction: discord.Interaction):
     channel_name = user.name + "'s Application"
     application_channel = await create_channel(guild, user, channel_category, channel_name)
     embed = embeds.application_message_embed(discord, guild, user, support_role_id)
-    current_working_directory = os.getcwd()
-    print("Current Working Directory:", current_working_directory) #todo change the working directory
-    file = discord.File("DiscordBots/Lori Keeper/pictures/application_question.png", filename="application_question.png")
+    file = discord.File("/home/milan/DiscordBots/Lori Keeper/pictures/application_question.png", filename="application_question.png")
     embed.set_image(url="attachment://application_question.png")
     await application_channel.send(embed=embed, file=file)
     return application_channel
@@ -192,7 +199,19 @@ async def on_ready():
         update_stats_loop.start()
 
     await start_webhook_server()
-    print("Bot is ready")
+
+    guild = discord.Object(id=GUILD_ID)
+    synced = await bot.tree.sync(guild=guild)
+    print(f"✅ {len(synced)} Slash Commands synchronized!")
+
+    # === Load initial dynamic stats ===
+    ftp_downloader.refresh_dynamic_stats()
+
+    # === Start daily FTP task ===
+    bot.loop.create_task(ftp_downloader.daily_ftp_task(bot))
+
+    usercache.load_usercache()
+    print("🤖 Bot ready")
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -288,7 +307,7 @@ async def promotion_to_player(ctx, member: discord.Member):
     message = await ctx.send(f"Congratulations {member.mention}, your application got accepted! You are an official "
                              f"{player_role.mention} of the server now!!\nCheck out the https://discord.com/channels/1403166544535752734/1403183602371530872"
                              f" to get the Server IP & Modpack and finally dive in our world 🎮\n"
-                             f" Note: You'll get a Whitelist-Code when joining the server for the first time. Navigate to {channel.mention} and type /link with the given code to link your discord account with your mc account")
+                             f" Note: You'll get a Whitelist-Code when joining the server for the first time. Navigate to {channel.mention} and type /verify with the given code to link your discord account with your mc account")
     await responses.add_celebration_reactions(message, 2)
 
 @bot.event
@@ -355,10 +374,10 @@ async def get_server_stats_embed(public_ip):
         ram_history.pop(0)
 
     # UTC+2 Zeitzone definieren
-    tz_utc_plus_2 = timezone(timedelta(hours=2))
+    tz_utc_plus_2 = datetime.timezone(datetime.timedelta(hours=2))
 
     # aktuelle Zeit in UTC+2, aber in UTC konvertieren
-    local_time = datetime.now(tz_utc_plus_2)
+    local_time = datetime.datetime.now(tz_utc_plus_2)
 
     embed = discord.Embed(
         title=f"🖥️ Server Info",
@@ -570,6 +589,98 @@ async def start_webhook_server():
     await site.start()
     print("🚀 Ko-fi Webhook Server läuft auf Port 8080")
 
+# ================ LEADERBOARD ================
+# =============================================
+
+# === FTP / Local Mode Config ===
+STATS_DIR = os.path.join("libs", "stats")
+load_dotenv()
+
+TOKEN = os.getenv("TEST_BOT_TOKEN")
+FTP_ADDRESS = os.getenv("FTP_ADDRESS_DISABLE", "").strip()
+FTP_PORT = os.getenv("FTP_PORT", "").strip()
+FTP_USERNAME = os.getenv("FTP_USERNAME", "").strip()
+FTP_PASS = os.getenv("FTP_PASS", "").strip()
+GUILD_ID = os.getenv("GUILD_ID")
+
+# === Slash Commands ===
+GUILD = discord.Object(id=GUILD_ID)
+
+@bot.tree.command(name="stats", description="Show a player's statistic", guild=GUILD)
+@app_commands.describe(
+    target="Player name or leaderboard rank",
+    category="Statistic category",
+    stat="Statistic name"
+)
+async def stats(interaction: discord.Interaction, target: str, category: str, stat: str):
+    await interaction.response.defer()
+    full_stat = constants.DISTANCE_ALIASES.get(f"{category}:{stat}", f"minecraft:{category}:minecraft:{stat}")
+    leaderboard = await build_leaderboard(full_stat)
+    if not leaderboard or all(v == 0 for _, v in leaderboard):
+        await interaction.followup.send(f"⚠️ The category `{category}` or stat `{stat}` doesn't exist.", ephemeral=True)
+        return
+    surrounding, start_rank = get_surrounding_leaderboard(leaderboard, target)
+    if not surrounding:
+        await interaction.followup.send(f"⚠️ Player or rank `{target}` doesn't exist.", ephemeral=True)
+        return
+    embed = Embed(title="Statistic", description=format_leaderboard(full_stat, target, surrounding, start_rank), color=0x00BFFF)
+    await interaction.followup.send(embed=embed)
+
+
+# === Autocomplete Handler ===
+@stats.autocomplete("category")
+async def category_autocomplete(interaction: discord.Interaction, current: str):
+    CATEGORIES = ["mined", "crafted", "used", "killed", "custom"]
+    return [
+        app_commands.Choice(name=cat, value=cat)
+        for cat in CATEGORIES
+        if current.lower() in cat.lower()
+    ][:25]
+
+@stats.autocomplete("stat")
+async def stat_autocomplete(interaction: discord.Interaction, current: str):
+    category = getattr(interaction.namespace, "category", None)
+
+    # Wenn keine Kategorie gewählt -> abbrechen, keine Vorschläge
+    if not category:
+        return [
+            app_commands.Choice(
+                name="⚠️ Please select a category first",
+                value="none"
+            )
+        ]
+
+    if category not in ftp_downloader.DYNAMIC_STATS:
+        return []
+
+    stats_for_category = list(ftp_downloader.DYNAMIC_STATS[category])
+
+    if category == "custom":
+        alias_list = []
+        for alias_full, target in constants.DISTANCE_ALIASES.items():
+            alias_short = alias_full.split(":", 1)[1]
+            target_key = target.split(":")[-1]
+            if target_key in ftp_downloader.DYNAMIC_STATS.get("custom", []):
+                alias_list.append(alias_short)
+
+        alias_set = set(alias_list)
+
+        remaining = [
+            s for s in stats_for_category
+            if not (s.endswith("_one_cm") and any(s in t for t in constants.DISTANCE_ALIASES.values()))
+            and s not in alias_set
+        ]
+
+        stats_for_category = alias_list + remaining
+
+    current_lower = (current or "").lower()
+    filtered = [
+        app_commands.Choice(name=stat, value=stat)
+        for stat in stats_for_category
+        if current_lower in stat.lower()
+    ][:25]
+
+    return filtered
 
 async def cleanup():
 
